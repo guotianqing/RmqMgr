@@ -18,9 +18,11 @@ int main()
 	mq.bindingKey = ""; // 接收端设置，广播模式无需该值
 
 	TestBase rmq;
-	rmq.Init(mq);
-	string err;
-	rmq.PublishMsg("I love you", err); // 会接收到自己发送的消息
+	if (rmq.Init(mq))
+	{
+		string err;
+		rmq.PublishMsg("I love you", err); // 会接收到自己发送的消息
+	}
 
 	cin.get();
 	return 0;

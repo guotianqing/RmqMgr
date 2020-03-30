@@ -8,14 +8,13 @@
 
 using namespace std;
 
-RmqMgrBase::RmqMgrBase(/* args */)
+RmqMgrBase::RmqMgrBase()
 {
-	m_handler = nullptr;
 	m_connection = nullptr;
 	m_channel = nullptr;
-	m_quitFlag = false;
+	m_channelPub = nullptr;
 	m_isAutoResume = false;
-	m_pTcpClient = nullptr;
+	m_pTcpMgr = nullptr;
 }
 
 RmqMgrBase::~RmqMgrBase()
@@ -41,113 +40,35 @@ bool RmqMgrBase::StartMqInstance(string &err)
 {
 	try
 	{
-		if (m_pTcpClient == nullptr)
-		{
-			m_pTcpClient = boost::make_shared<TcpClient>();
-			m_pTcpClient->Start(m_mqInfo, boost::shared_ptr<RmqMgrBase>(this));
-		}
+		m_pTcpMgr = TcpMgr::Init(m_mqInfo, this);
 
 		// 等待Rmq登录成功
-		if (!m_pTcpClient->WaitforReady())
+		if (!m_pTcpMgr->WaitForReady())
 		{
 			err.assign("Rmq登录失败");
 			OnRtnErrMsg(err);
-			OnStatusChange(false);
-			ReStartMqInstance(err);
+			return false;
 		}
 
-		if (m_handler == nullptr)
-		{
-			//m_handler = boost::make_shared<MyConnectionHandler>(m_pTcpClient);
-			m_handler = m_pTcpClient->GetConnectionHandler();
-		}
-
-		// make a connection
-		if (!CreateMqConnection(m_mqInfo.ip, m_mqInfo.port, m_mqInfo.loginName, m_mqInfo.loginPwd, err))
-		{
-			OnRtnErrMsg(err);
-			OnStatusChange(false);
-			ReStartMqInstance(err);
-		}
+		// get the connection
+		GetMqConnection();
 
 		// make a channel
-		if (m_channel == nullptr || !(m_channel->usable()))
-		{
-			// make sure connection ok
-			if (!CreateMqConnection(m_mqInfo.ip, m_mqInfo.port, m_mqInfo.loginName, m_mqInfo.loginPwd, err))
-			{
-				OnRtnErrMsg(err);
-				OnStatusChange(false);
-				ReStartMqInstance(err);
-			}
-			if (!CreateMqChannel(err))
-			{
-				OnRtnErrMsg(err);
-				OnStatusChange(false);
-				ReStartMqInstance(err);
-			}
-		}
-
-		if (!CreateMqExchange(m_mqInfo.exchangeName, m_mqInfo.exchangeType, err))
+		if (!CreateMqChannel(err))
 		{
 			OnRtnErrMsg(err);
 			OnStatusChange(false);
-			ReStartMqInstance(err);
-		}
-
-		if (!CreateMqQueue(m_mqInfo.queueName, err))
-		{
-			OnRtnErrMsg(err);
-			OnStatusChange(false);
-			ReStartMqInstance(err);
-		}
-
-		if (!BindQueue(m_mqInfo.queueName, m_mqInfo.exchangeName, m_mqInfo.bindingKey, err))
-		{
-			OnRtnErrMsg(err);
-			OnStatusChange(false);
-			ReStartMqInstance(err);
-		}
-
-		if (!StartConsumeMsg(m_mqInfo.queueName, err))
-		{
-			OnRtnErrMsg(err);
-			OnStatusChange(false);
-			ReStartMqInstance(err);
+			return false;
 		}
 	}
 	catch (const std::exception &e)
 	{
 		err.assign("初始化mq实例失败：" + string(e.what()));
 		OnRtnErrMsg(err);
-		OnStatusChange(false);
-		ReStartMqInstance(err);
+		return false;
 	}
 
 	return true;
-}
-
-void RmqMgrBase::ReStartMqInstance(string &err)
-{
-	m_quitFlag = false;
-	m_isAutoResume = true;
-	while (!m_quitFlag)
-	{
-		OnRtnErrMsg(err.append(", 尝试重新启动"));
-		std::this_thread::sleep_for(std::chrono::seconds(2));
-		// if (!ReleaseMqInstance(err, m_isAutoResume))
-		// {
-		//     OnRtnErrMsg(err);
-		//     continue;
-		// }
-		if (!StartMqInstance(err))
-		{
-			OnRtnErrMsg(err);
-			continue;
-		}
-		m_quitFlag = true;
-		m_isAutoResume = false;
-	}
 }
 
 bool RmqMgrBase::ReleaseMqInstance(string &err, const bool m_isAutoResume)
@@ -156,7 +77,6 @@ bool RmqMgrBase::ReleaseMqInstance(string &err, const bool m_isAutoResume)
 	{
 		if (!m_isAutoResume)
 		{
-			m_quitFlag = true;
 		}
 
 		if (!CloseMqChannel(err))
@@ -169,7 +89,7 @@ bool RmqMgrBase::ReleaseMqInstance(string &err, const bool m_isAutoResume)
 			return false;
 		}
 
-		m_pTcpClient->Stop();
+		m_pTcpMgr->Finit();
 	}
 	catch (const std::exception &e)
 	{
@@ -180,25 +100,21 @@ bool RmqMgrBase::ReleaseMqInstance(string &err, const bool m_isAutoResume)
 	return true;
 }
 
-bool RmqMgrBase::CreateMqConnection(const string &ip, const unsigned short &port, const string &loginName, const string &loginPwd, string &err)
+void RmqMgrBase::GetMqConnection()
 {
-	try
+	if (!m_pTcpMgr)
 	{
-		if (m_connection == nullptr || !m_connection->ready() || !m_connection->usable())
+		string err;
+		if (!StartMqInstance(err))
 		{
-			//string connInfo = "amqp://" + loginName + ":" + loginPwd + "@" + ip + ":" + to_string(port);
-			//m_connection = boost::make_shared<AMQP::Connection >(m_handler.get(), AMQP::Address(connInfo));
-			m_connection = m_pTcpClient->GetConnection();
-			//m_connection = boost::make_shared<AMQP::Connection>(m_handler.get(), AMQP::Login(m_mqInfo.loginName, m_mqInfo.loginPwd), "/");
+			OnRtnErrMsg(err);
+			return;
 		}
 	}
-	catch (const std::exception &e)
+	else
 	{
-		err.assign("创建Connection失败：" + string(e.what()));
-		return false;
+		m_connection = m_pTcpMgr->GetConnection();
 	}
-
-	return true;
 }
 
 bool RmqMgrBase::CloseMqConnection(string &err)
@@ -228,10 +144,11 @@ bool RmqMgrBase::CreateMqChannel(string &err)
 {
 	try
 	{
-		// we need a channel too
-		// AMQP::TcpChannel channel(m_connection.get());
+		if (!m_connection || !m_connection->usable())
+		{
+			GetMqConnection();
+		}
 		m_channel = boost::make_shared<AMQP::Channel>(m_connection.get());
-
 		// 通道发生错误时调用回调函数
 		m_channel->onError(std::bind(&RmqMgrBase::ChannelErrCb, this, std::placeholders::_1));
 		m_channel->onReady(std::bind(&RmqMgrBase::ChannelOkCb, this));
@@ -251,12 +168,34 @@ void RmqMgrBase::ChannelErrCb(const char *msg)
 	err = "当前通道发生错误：" + string(msg);
 	OnRtnErrMsg(err);
 	OnStatusChange(false);
-	ReStartMqInstance(err);
+	std::this_thread::sleep_for(1s);
+	CreateMqChannel(err);
 }
 
 void RmqMgrBase::ChannelOkCb()
 {
 	OnStatusChange(true);
+	CreateMqPubChannel();
+	string err;
+	if (!CreateMqExchange(m_mqInfo.exchangeName, m_mqInfo.exchangeType, err))
+	{
+		OnRtnErrMsg(err);
+	}
+
+	if (!CreateMqQueue(m_mqInfo.queueName, err))
+	{
+		OnRtnErrMsg(err);
+	}
+
+	if (!BindQueue(m_mqInfo.queueName, m_mqInfo.exchangeName, m_mqInfo.bindingKey, err))
+	{
+		OnRtnErrMsg(err);
+	}
+
+	if (!StartConsumeMsg(m_mqInfo.queueName, err))
+	{
+		OnRtnErrMsg(err);
+	}
 }
 
 bool RmqMgrBase::CloseMqChannel(string &err)
@@ -266,6 +205,11 @@ bool RmqMgrBase::CloseMqChannel(string &err)
 		if (m_channel->usable())
 		{
 			m_channel->close()
+				.onError(std::bind(&RmqMgrBase::ChannelCloseErrCb, this, std::placeholders::_1));
+		}
+		if (m_channelPub->usable())
+		{
+			m_channelPub->close()
 				.onError(std::bind(&RmqMgrBase::ChannelCloseErrCb, this, std::placeholders::_1));
 		}
 	}
@@ -334,7 +278,8 @@ void RmqMgrBase::CreatMqExchangeErrCb(const char *msg)
 	err = "创建Exchange发生错误：" + string(msg);
 	OnRtnErrMsg(err);
 	OnStatusChange(false);
-	ReStartMqInstance(err);
+	// 通道不再可用，创建通道
+	CreateMqChannel(err);
 }
 
 bool RmqMgrBase::CreateMqQueue(const string &queueName, string &err)
@@ -359,7 +304,8 @@ void RmqMgrBase::CreatMqQueueErrCb(const char *msg)
 	err = "创建Queue发生错误：" + string(msg);
 	OnRtnErrMsg(err);
 	OnStatusChange(false);
-	ReStartMqInstance(err);
+	// 通道不再可用，创建通道
+	CreateMqChannel(err);
 }
 
 bool RmqMgrBase::BindQueue(const string &queueName, const string &exchangeName, const string &bindingKey, string &err)
@@ -384,7 +330,8 @@ void RmqMgrBase::BindQueueErrCb(const char *msg)
 	err = "绑定Queue发生错误：" + string(msg);
 	OnRtnErrMsg(err);
 	OnStatusChange(false);
-	ReStartMqInstance(err);
+	// 通道不再可用，创建通道
+	CreateMqChannel(err);
 }
 
 // 设置客户端同时处理的任务数量，结合多个客户端，可以实现公平的任务处理
@@ -410,17 +357,42 @@ void RmqMgrBase::SetQosValueErrCb(const char *msg)
 	err = "设置Qos值发生错误：" + string(msg);
 	OnRtnErrMsg(err);
 	OnStatusChange(false);
-	ReStartMqInstance(err);
+	// 通道不再可用，创建通道
+	CreateMqChannel(err);
+}
+
+// 通道是非线程安全的
+// 用于发送数据的通道，在实际测试中，单通道无法支撑较大的数据流量
+void RmqMgrBase::CreateMqPubChannel()
+{
+	try
+	{
+		m_channelPub = boost::make_shared<AMQP::Channel>(m_connection.get());
+		// 创建用于发送数据通道
+		m_channelPub->onError([this](const char *message) {
+			string err;
+			err = "发送数据通道发生错误：" + string(message);
+			OnRtnErrMsg(err);
+			OnStatusChange(false);
+		});
+	}
+	catch (const std::exception &e)
+	{
+		string err("发送数据通道发生错误：");
+		err.append(e.what());
+		OnRtnErrMsg(err);
+		OnStatusChange(false);
+	}
 }
 
 bool RmqMgrBase::PublishMsg(const string &msg, string &err)
 {
 	try
 	{
-		std::lock_guard<mutex> lck(m_mtxPublishMsg);
-		m_channel->publish(m_mqInfo.exchangeName, m_mqInfo.routingKey, msg)
-			.onSuccess(std::bind(&RmqMgrBase::PublishMsgOkCb, this))
-			.onError(std::bind(&RmqMgrBase::PublishMsgErrCb, this, std::placeholders::_1));
+		// TODO: 
+		// 单通道无法支撑较大的数据流量，且通道出错后无法恢复，请考虑使用channel_pool（）
+		//AMQP::Channel channel(m_connection.get());
+		m_channelPub->publish(m_mqInfo.exchangeName, m_mqInfo.routingKey, msg);
 	}
 	catch (const std::exception &e)
 	{
@@ -431,25 +403,11 @@ bool RmqMgrBase::PublishMsg(const string &msg, string &err)
 	return true;
 }
 
-void RmqMgrBase::PublishMsgErrCb(const char *msg)
-{
-	string err;
-	err = "发布消息发生错误：" + string(msg);
-	OnRtnErrMsg(err);
-	OnStatusChange(false);
-	ReStartMqInstance(err);
-}
-
-void RmqMgrBase::PublishMsgOkCb()
-{
-	//m_handler->UpdateHbCurrTime();
-}
-
 bool RmqMgrBase::StartConsumeMsg(const string &queueName, string &err)
 {
 	try
 	{
-		// 默认需要ack
+		// 自动ack
 		m_channel->consume(queueName)
 			.onReceived(std::bind(&RmqMgrBase::ConsumeRecvedCb, this, std::placeholders::_1, std::placeholders::_2, std::placeholders::_3))
 			.onError(std::bind(&RmqMgrBase::ConsumeErrorCb, this, std::placeholders::_1));
@@ -464,9 +422,7 @@ bool RmqMgrBase::StartConsumeMsg(const string &queueName, string &err)
 
 void RmqMgrBase::ConsumeRecvedCb(const AMQP::Message &message, uint64_t deliveryTag, bool redelivered)
 {
-	//m_handler->UpdateHbCurrTime();
-	string msg(message.body(), message.bodySize());
-	OnRecvedData(msg.c_str(), msg.length()); // 由相应的子函数处理
+	OnRecvedData(message.body(), message.bodySize()); // 由相应的子函数处理
 
 	// acknowledge the message
 	m_channel->ack(deliveryTag);
@@ -478,145 +434,161 @@ void RmqMgrBase::ConsumeErrorCb(const char *msg)
 	err = "消费消息发生错误：" + string(msg);
 	OnRtnErrMsg(err);
 	OnStatusChange(false);
-	ReStartMqInstance(err);
-}
-
-void RmqMgrBase::ConsumeOkCb(const std::string &consumertag)
-{
-	//m_handler->UpdateHbCurrTime();
+	// 通道不再可用，创建通道
+	CreateMqChannel(err);
 }
 
 // MyConnectionHandler
-MyConnectionHandler::MyConnectionHandler(boost::shared_ptr<TcpClient> pTcpClient)
+MyConnectionHandler::MyConnectionHandler(boost::shared_ptr<TcpMgr> pTcpMgr)
 {
-	m_pTcpClient = pTcpClient;
-}
-
-MyConnectionHandler::~MyConnectionHandler()
-{
+	m_pTcpMgr = pTcpMgr;
 }
 
 void MyConnectionHandler::onData(AMQP::Connection *connection, const char *data, size_t size)
 {
 	try
 	{
-		m_pTcpClient->SendData((const uint8_t*)data, size);
+		if (!m_pTcpMgr)
+		{
+			return;
+		}
+		string err;
+		string msg(data, size);
+		m_pTcpMgr->SendData(msg, err);
 	}
 	catch (const std::exception&e)
 	{
-		m_pTcpClient->OnErrMsg("向RabbitMq发送数据失败：" + string(e.what()));
+		m_pTcpMgr->OnErrMsg("向RabbitMq发送数据失败：" + string(e.what()));
 	}
 }
 
 void MyConnectionHandler::onReady(AMQP::Connection *connection)
 {
-	m_pTcpClient->SetReadyFlag();
+	m_pTcpMgr->SetLoginReady();
 }
 
 void MyConnectionHandler::onError(AMQP::Connection *connection, const char *message)
 {
-	m_pTcpClient->OnErrMsg("RabbitMq发生错误：" + string(message));
+	m_pTcpMgr->OnErrMsg("RabbitMq发生错误：" + string(message));
 }
 
 void MyConnectionHandler::onClosed(AMQP::Connection *connection)
 {
-	m_pTcpClient->OnErrMsg(string("RabbitMq对端关闭连接"));
+	m_pTcpMgr->OnErrMsg(string("RabbitMq对端关闭连接"));
 }
 
-// TcpClient
-TcpClient::TcpClient()
+TcpMgr::TcpMgr()
 	: m_work(m_ios),
-	m_sock(m_ios)
-{
-	m_socketStarted = false;
-	m_numOfWorkThreads = 1;
-	memset(m_readBuf, 0, sizeof(m_readBuf));
-	m_bparse = false;
-	m_pHandler = nullptr;
-	m_pConnect = nullptr;
-	m_pRmqMgrBase = nullptr;
-}
-
-TcpClient::~TcpClient()
+	m_strand(m_ios),
+	m_sock(m_ios),
+	m_socketStarted(false),
+	m_is_ready(false)
 {
 }
 
-void TcpClient::Run()
+boost::shared_ptr<TcpMgr> TcpMgr::Init(const MqInfo& mqInfo, RmqMgrBase *pRmqMgrBase)
 {
+	boost::shared_ptr<TcpMgr> newTcpMgr(new TcpMgr());
+	newTcpMgr->Start(mqInfo, pRmqMgrBase);
+	return newTcpMgr;
+}
+
+void TcpMgr::Run()
+{
+	/*auto id = std::this_thread::get_id();
+	stringstream ss;
+	ss << id;
+	OnErrMsg("Rmq内部线程, threadid: " + ss.str());*/
 	m_ios.run();
 }
 
-void TcpClient::Stop()
+void TcpMgr::Finit()
 {
+	CloseSocket();
 	m_ios.stop();
 	m_threads.join_all();
 }
 
-void TcpClient::SetReadyFlag()
-{
-	m_bready.set_value(true);
-}
-
-void TcpClient::Start(const MqInfo& mqInfo, boost::shared_ptr<RmqMgrBase> pRmqMgrBase)
+void TcpMgr::Start(const MqInfo& mqInfo, RmqMgrBase *pRmqMgrBase)
 {
 	m_mqInfo = mqInfo;
 	m_pRmqMgrBase = pRmqMgrBase;
-	m_pHandler = boost::make_shared<MyConnectionHandler>(shared_from_this());
+	m_pHandler = new MyConnectionHandler(shared_from_this());
 	boost::asio::ip::tcp::endpoint ep(boost::asio::ip::address::from_string(m_mqInfo.ip), m_mqInfo.port);
-	m_sock.async_connect(ep, MEM_FN1(OnConnect, _1));
-	while (m_numOfWorkThreads--)
+	m_sock.async_connect(ep, m_strand.wrap(boost::bind(&TcpMgr::OnConnect, shared_from_this(), _1)));
+	for (auto i = 0; i < kNumOfWorkThreads; ++i)
 	{
-		m_threads.create_thread(boost::bind(&TcpClient::Run, this));
+		m_threads.create_thread(boost::bind(&TcpMgr::Run, this));
 	}
 }
 
-bool TcpClient::WaitforReady()
+void TcpMgr::OnConnect(const error_code &err)
 {
-	std::future<bool> ret = m_bready.get_future();
-	if (ret.wait_for(std::chrono::seconds(INFINITE)) == std::future_status::ready)
-	{
-		return true;
-	}
-	return false;
-}
-
-void TcpClient::OnConnect(const error_code &err)
-{
-	if (!err)
+	if (!err && m_sock.is_open())
 	{
 		m_socketStarted = true;
 		// tcp连接建立成功，开始登录Rmq
-		m_pConnect = boost::make_shared<AMQP::Connection>(m_pHandler.get(), AMQP::Login(m_mqInfo.loginName, m_mqInfo.loginPwd));
-		// 开始监听是否有数据到来
+		m_pConnect = boost::make_shared<AMQP::Connection>(m_pHandler, AMQP::Login(m_mqInfo.loginName, m_mqInfo.loginPwd));
+		// 开始接收数据
 		RecvData();
 	}
 	else
 	{
-		m_bready.set_value(false);
 		OnErrMsg("与RabbitMq建立连接失败：" + err.message());
 		m_socketStarted = false;
 		ReConnectServer();
 	}
 }
 
-void TcpClient::ReConnectServer()
+void TcpMgr::RecvData(int32_t total_bytes)
 {
-	std::this_thread::sleep_for(std::chrono::seconds(2));
-	boost::asio::ip::tcp::endpoint ep(boost::asio::ip::address::from_string(m_mqInfo.ip), m_mqInfo.port);
-	m_sock.async_connect(ep, MEM_FN1(OnConnect, _1));
+	m_strand.post(boost::bind(&TcpMgr::DispatchRecv, shared_from_this(), total_bytes));
 }
 
-void TcpClient::OnReadData(const error_code &err, size_t bytes)
+void TcpMgr::DispatchRecv(int32_t total_bytes)
+{
+	bool should_start_receive = m_pending_recvs.empty();
+	m_pending_recvs.push_back(total_bytes);
+	if (should_start_receive)
+	{
+		StartRecv(total_bytes);
+	}
+}
+
+void TcpMgr::StartRecv(int32_t total_bytes)
+{
+	if (total_bytes > 0)
+	{
+		m_recv_buffer.resize(total_bytes);
+		boost::asio::async_read(m_sock, boost::asio::buffer(m_recv_buffer), m_strand.wrap(boost::bind(&TcpMgr::HandleRecv, shared_from_this(), _1, _2)));
+	}
+	else
+	{
+		m_recv_buffer.resize(kReceiveBufferSize);
+		m_sock.async_read_some(boost::asio::buffer(m_recv_buffer), m_strand.wrap(boost::bind(&TcpMgr::HandleRecv, shared_from_this(), _1, _2)));
+	}
+}
+
+void TcpMgr::HandleRecv(const error_code &err, size_t bytes)
 {
 	if (!err)
 	{
+		m_recv_buffer.resize(bytes);
 		{
 			// 保存数据到已接收缓存
-			std::lock_guard<std::mutex> guard(m_lock);
-			m_recvedBuf.insert(m_recvedBuf.end(), m_readBuf, m_readBuf + bytes);
+			//std::lock_guard<std::mutex> guard(m_lock);
+			m_parseBuf.insert(m_parseBuf.end(), m_recv_buffer.begin(), m_recv_buffer.end());
+			ParseAmqpData();
 		}
-		RecvData();
-		parse();
+		m_pending_recvs.pop_front();
+		if (!m_pending_recvs.empty())
+		{
+			StartRecv(m_pending_recvs.front());
+		}
+		else
+		{
+			RecvData();
+		}
 	}
 	else
 	{
@@ -626,31 +598,20 @@ void TcpClient::OnReadData(const error_code &err, size_t bytes)
 	}
 }
 
-void TcpClient::parse()
+void TcpMgr::ParseAmqpData()
 {
 	try
 	{
-		uint64_t use = 0;
-
-		///> 不阻塞线程，parse一次只能一个线程调用，不能多个线程
-		std::unique_lock<std::mutex> guard(m_lock, std::try_to_lock);
-		if (!guard.owns_lock())
-			return;
-		if (m_bparse)
-			return;
-		m_bparse = true;
-		size_t size = m_recvedBuf.size();
-		while (size - use >= m_pConnect->expected())
+		auto data_size = m_parseBuf.size();
+		size_t parsed_bytes = 0;
+		auto expected_bytes = m_pConnect->expected();
+		while (data_size - parsed_bytes >= expected_bytes)
 		{
-			std::vector<char> buff(m_recvedBuf.begin() + use, m_recvedBuf.begin() + use + m_pConnect->expected());
-			///> 解析期间打开锁，允许接收数据
-			guard.unlock();
-			use += m_pConnect->parse(buff.data(), buff.size());
-			guard.lock();
+			std::vector<char> buff(m_parseBuf.begin() + parsed_bytes, m_parseBuf.begin() + parsed_bytes + expected_bytes);
+			parsed_bytes += m_pConnect->parse(buff.data(), buff.size());
+			expected_bytes = m_pConnect->expected();
 		}
-
-		m_recvedBuf.erase(m_recvedBuf.begin(), m_recvedBuf.begin() + use);
-		m_bparse = false;
+		m_parseBuf.erase(m_parseBuf.begin(), m_parseBuf.begin() + parsed_bytes);
 	}
 	catch (const std::exception&e)
 	{
@@ -658,59 +619,103 @@ void TcpClient::parse()
 	}
 }
 
-void TcpClient::OnWrite(const error_code &err, size_t bytes)
+bool TcpMgr::SendData(const string &msg, std::string errmsg)
+{
+	try
+	{
+		auto pmsg(boost::make_shared<string>(msg));
+		m_strand.post(boost::bind(&TcpMgr::SendMsg, shared_from_this(), pmsg));
+	}
+	catch (const std::exception &e)
+	{
+		errmsg.assign("发送数据失败：" + string(e.what()));
+		return false;
+	}
+
+	return true;
+}
+
+void TcpMgr::SendMsg(boost::shared_ptr<string> pmsg)
+{
+	bool should_start_send = m_pending_sends.empty();
+	m_pending_sends.emplace_back(pmsg);
+	if (should_start_send)
+	{
+		StartSend();
+	}
+}
+
+void TcpMgr::StartSend()
+{
+	if (!m_pending_sends.empty())
+	{
+		boost::asio::async_write(m_sock, boost::asio::buffer(*m_pending_sends.front().get()), m_strand.wrap(boost::bind(&TcpMgr::HandleWrite, shared_from_this(), _1)));
+	}
+}
+
+void TcpMgr::HandleWrite(const error_code &err)
 {
 	if (err)
 	{
 		OnErrMsg("发送数据失败：" + err.message());
+		CloseSocket();
+		ReConnectServer();
 	}
 	else
 	{
-		//cout << "data send succ, len = " << bytes << endl;
+		m_pending_sends.pop_front();
+		StartSend();
 	}
 }
 
-void TcpClient::SendData(const uint8_t *data, const size_t len)
+void TcpMgr::ReConnectServer()
 {
-	if (!IsSocketStarted())
-	{
-		OnErrMsg(string("发送数据失败：socket尚未启动"));
-		return;
-	}
-	m_writeBuf.assign(data, data + len);
-	m_sock.async_write_some(boost::asio::buffer(data, len), MEM_FN2(OnWrite, _1, _2));
+	std::this_thread::sleep_for(std::chrono::milliseconds(kTcpRetryInterval));
+	boost::asio::ip::tcp::endpoint ep(boost::asio::ip::address::from_string(m_mqInfo.ip), m_mqInfo.port);
+	m_sock.async_connect(ep, m_strand.wrap(boost::bind(&TcpMgr::OnConnect, shared_from_this(), _1)));
 }
 
-void TcpClient::RecvData()
+void TcpMgr::CloseSocket()
 {
-	async_read(m_sock, boost::asio::buffer(m_readBuf, sizeof(m_readBuf)), MEM_FN2(OnReadData, _1, _2));
+	OnErrMsg(string("Rmq底层socket关闭"));
+	m_strand.post(boost::bind(&TcpMgr::StartCloseSocket, shared_from_this()));
 }
 
-void TcpClient::CloseSocket()
+void TcpMgr::StartCloseSocket()
 {
 	if (!m_socketStarted)
+	{
 		return;
+	}
+	boost::system::error_code ec;
+	m_sock.shutdown(boost::asio::ip::tcp::socket::shutdown_both, ec);
+	m_sock.close(ec);
 	m_socketStarted = false;
-	m_sock.close();
-	OnErrMsg(string("本端关闭连接"));
 }
 
-bool TcpClient::IsSocketStarted()
+void TcpMgr::SetLoginReady()
 {
-	return m_socketStarted;
+	{
+		std::lock_guard<std::mutex> lk(m_mtx_login);
+		m_is_ready = true;
+	}
+	m_cv_login_succ.notify_all();
 }
 
-boost::shared_ptr<MyConnectionHandler> TcpClient::GetConnectionHandler()
+bool TcpMgr::WaitForReady()
 {
-	return m_pHandler;
+	std::unique_lock<std::mutex> lk(m_mtx_login);
+	return m_cv_login_succ.wait_for(lk, std::chrono::seconds(kLoginRmqTimeOut), [this] {
+		return m_is_ready;
+	});
 }
 
-boost::shared_ptr<AMQP::Connection> TcpClient::GetConnection()
+boost::shared_ptr<AMQP::Connection> TcpMgr::GetConnection()
 {
 	return m_pConnect;
 }
 
-void TcpClient::OnErrMsg(std::string& msg)
+void TcpMgr::OnErrMsg(std::string& msg)
 {
 	m_pRmqMgrBase->OnRtnErrMsg(msg);
 }

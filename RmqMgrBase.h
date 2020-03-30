@@ -3,11 +3,12 @@
 
 #include <string>
 #include <mutex>
-#include <future>
+#include <condition_variable>
 #include <boost/shared_ptr.hpp>
 #include <boost/asio.hpp>
 #include <boost/enable_shared_from_this.hpp>
 #include <boost/thread.hpp>
+
 
 #include "amqpcpp.h"
 
@@ -27,30 +28,50 @@ typedef struct _mqinfo
 } MqInfo;
 
 class MyConnectionHandler;
-class TcpClient;
+class TcpMgr;
 
 class RmqMgrBase
 {
+public:
+	RmqMgrBase();
+	virtual ~RmqMgrBase();
+
+	// 初始化时调用，设置RabbitMq基本信息
+	bool MqInfoInit(const MqInfo &mqInfo, string &err);
+	// 初始化时调用，启动连接、建立通道、创建组件并开启消费
+	bool StartMqInstance(string &err);
+	// 发送消息时调用。特别注意：该函数非线程安全，需要确保在单一线程中调用
+	bool PublishMsg(const string &msg, string &err);
+	// 释放实例
+	bool ReleaseMqInstance(string &err, const bool isAutoResume = false);
+	// 返回错误信息，由子函数记录日志并处理
+	virtual void OnRtnErrMsg(string &err) = 0;
+
+protected:
+	// 由子函数实现
+	// 接收到数据，请勿进行耗时操作，否则会造成消息堆积。如果客户端负荷过重，建议使用负载均衡模式
+	virtual void OnRecvedData(const char *data, const uint64_t len) = 0;
+	// 返回状态
+	virtual void OnStatusChange(const bool isOk) = 0;
+
 private:
 	MqInfo m_mqInfo;
-	boost::shared_ptr<MyConnectionHandler> m_handler;
 	boost::shared_ptr<AMQP::Connection > m_connection;
 	boost::shared_ptr<AMQP::Channel> m_channel;
-	bool m_quitFlag;
+	boost::shared_ptr<AMQP::Channel> m_channelPub;
 	bool m_isAutoResume;
-	boost::shared_ptr<TcpClient> m_pTcpClient;
+	boost::shared_ptr<TcpMgr> m_pTcpMgr;
 
-	bool CreateMqConnection(const string &ip, const unsigned short &port, const string &loginName, const string &loginPwd, string &err);
+	void GetMqConnection();
 	bool CloseMqConnection(string &err);
 	bool CreateMqChannel(string &err);
+	void CreateMqPubChannel();
 	bool CloseMqChannel(string &err);
 	bool CreateMqExchange(const string &exchangeName, const string &exchangeType, string &err);
 	bool CreateMqQueue(const string &queueName, string &err);
 	bool BindQueue(const string &queueName, const string &exchangeName, const string &routingKey, string &err);
 	bool SetQosValue(const uint16_t val, string &err);
 	bool StartConsumeMsg(const string &queueName, string &err);
-	// 启动rabbitmq client，内部会启动线程异步处理rabbitmq指令
-	void ReStartMqInstance(string &err);
 
 	// 注册回调函数
 	void ChannelOkCb();
@@ -60,41 +81,18 @@ private:
 	void CreatMqQueueErrCb(const char *msg);
 	void BindQueueErrCb(const char *msg);
 	void SetQosValueErrCb(const char *msg);
-	void PublishMsgErrCb(const char *msg);
-	void PublishMsgOkCb();
 	void ConsumeRecvedCb(const AMQP::Message &message, uint64_t deliveryTag, bool redelivered);
 	void ConsumeErrorCb(const char *msg);
-	void ConsumeOkCb(const std::string &consumertag);
-
-	std::mutex m_mtxPublishMsg;
-public:
-	RmqMgrBase();
-	virtual ~RmqMgrBase();
-
-	bool MqInfoInit(const MqInfo &mqInfo, string &err);
-	bool StartMqInstance(string &err);
-	bool PublishMsg(const string &msg, string &err);
-	bool ReleaseMqInstance(string &err, const bool isAutoResume = false);
-
-	// 返回错误信息，由子函数记录日志并处理
-	virtual void OnRtnErrMsg(string &err) = 0;
-protected:
-	// 由子函数实现
-	// 接收到数据，请勿进行耗时操作，否则会造成消息堆积。如果客户端负荷过重，建议使用负载均衡模式
-	virtual void OnRecvedData(const char *data, const uint64_t len) = 0;
-	// 返回状态
-	virtual void OnStatusChange(const bool isOk) = 0;
 };
 
 // 处理TCP连接的类
 class MyConnectionHandler : public AMQP::ConnectionHandler
 {
 private:
-	boost::shared_ptr<TcpClient> m_pTcpClient;
+	boost::shared_ptr<TcpMgr> m_pTcpMgr;
 
 public:
-	MyConnectionHandler(boost::shared_ptr<TcpClient> pTcpClient);
-	~MyConnectionHandler();
+	MyConnectionHandler(boost::shared_ptr<TcpMgr> pTcpMgr);
 
 	// 数据待发送出去
 	virtual void onData(AMQP::Connection *connection, const char *data, size_t size);
@@ -106,55 +104,56 @@ public:
 	virtual void onClosed(AMQP::Connection *connection);
 };
 
-#define MEM_FN(x) boost::bind(&self_type::x, shared_from_this())
-#define MEM_FN1(x, y) boost::bind(&self_type::x, shared_from_this(), y)
-#define MEM_FN2(x, y, z) boost::bind(&self_type::x, shared_from_this(), y, z)
-
-class TcpClient : public boost::enable_shared_from_this<TcpClient>, boost::noncopyable
+class TcpMgr : public boost::enable_shared_from_this<TcpMgr>, boost::noncopyable
 {
-private:
-	typedef boost::system::error_code error_code;
-	typedef TcpClient self_type;
-	bool IsSocketStarted();
-	void OnConnect(const error_code &err);
-	void OnReadData(const error_code &err, size_t bytes);
-	void OnWrite(const error_code &err, size_t bytes);
-	void ReConnectServer();
-	void Run();
-	void RecvData();
-	void parse();
-
 public:
-	TcpClient();
-	~TcpClient();
-	void Start(const MqInfo& mqInfo, boost::shared_ptr<RmqMgrBase> pRmqMgrBase);
-	bool WaitforReady(); // 向上层反馈登录状态，注意，此函数会阻塞，直到就绪或失败
-	void SetReadyFlag();
-	void CloseSocket();
-	void SendData(const uint8_t *pDataInfo, const size_t len);
-	void Stop();
+	static boost::shared_ptr<TcpMgr> Init(const MqInfo& mqInfo, RmqMgrBase *pRmqMgrBase);
+	boost::shared_ptr<AMQP::Connection> GetConnection();
+	bool SendData(const std::string &msg, std::string errmsg);
+	bool WaitForReady();
+	void SetLoginReady();
+	void Finit();
 	void OnErrMsg(std::string& msg);
 
-	boost::shared_ptr<MyConnectionHandler> GetConnectionHandler();
-	boost::shared_ptr<AMQP::Connection> GetConnection();
-
 private:
+	using error_code = boost::system::error_code;
 	MqInfo m_mqInfo;
 	boost::asio::io_service m_ios;
 	boost::asio::io_service::work m_work;
+	boost::asio::io_service::strand m_strand;
 	boost::asio::ip::tcp::socket m_sock;
-	int m_numOfWorkThreads;
+	static const int kNumOfWorkThreads = 1; // 处理tcp的线程数量，如果是多线程，需要考虑同步问题
 	boost::thread_group m_threads;
 	bool m_socketStarted;
-	std::string m_writeBuf;
-	char m_readBuf[1];
-	std::vector<char> m_recvedBuf;//数据接收缓冲区
-	boost::shared_ptr<MyConnectionHandler> m_pHandler;
+	std::vector<char> m_recv_buffer;
+	std::vector<char> m_parseBuf; // 数据解析缓冲区
+	std::list<int32_t> m_pending_recvs;
+	static const int kReceiveBufferSize = 4096; // 默认每次接收数据量
+	std::list<boost::shared_ptr<std::string>> m_pending_sends;
+	RmqMgrBase *m_pRmqMgrBase;
+	MyConnectionHandler* m_pHandler;
 	boost::shared_ptr<AMQP::Connection> m_pConnect;
-	boost::shared_ptr<RmqMgrBase> m_pRmqMgrBase;
-	std::mutex m_lock;
-	bool m_bparse;
-	std::promise<bool> m_bready;//是否准备好
+	static const int kTcpRetryInterval = 1000; //ms
+	static const int kLoginRmqTimeOut = 10; //s
+	std::condition_variable m_cv_login_succ;
+	bool m_is_ready;
+	std::mutex m_mtx_login;
+
+	TcpMgr();
+	void Start(const MqInfo& mqInfo, RmqMgrBase *pRmqMgrBase);
+	void OnConnect(const error_code &err);
+	void HandleWrite(const error_code &err);
+	void ReConnectServer();
+	void RecvData(int32_t total_bytes = 0);
+	void DispatchRecv(int32_t total_bytes);
+	void StartRecv(int32_t total_bytes);
+	void HandleRecv(const error_code &err, size_t bytes);
+	void SendMsg(boost::shared_ptr<string> msg);
+	void StartSend();
+	void Run();
+	void CloseSocket();
+	void StartCloseSocket();
+	void ParseAmqpData();
 };
 
 #endif

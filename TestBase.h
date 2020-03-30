@@ -6,6 +6,10 @@
 
 class TestBase : public RmqMgrBase
 {
+public:
+	bool Init(const MqInfo &mqinfo);
+	void Finit();
+
 private:
 	std::atomic<bool> m_mqConnState;
 
@@ -13,9 +17,6 @@ private:
 	virtual void OnStatusChange(const bool isOk);
 	virtual void OnRecvedData(const char *data, const uint64_t len);
 
-public:
-	bool Init(const MqInfo &mqinfo);
-	void Finit();
 };
 
 #endif
